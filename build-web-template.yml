@@ -1,0 +1,93 @@
+name: Build slim Godot web template
+
+on:
+  workflow_dispatch:
+    inputs:
+      godot_ref:
+        description: "Godot tag to build (must match the editor you export with)"
+        default: "4.7.2-stable"
+
+env:
+  BASELINE_WASM_BYTES: "19352130"   # godot.wasm of your current working template
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [safe, extra]      # extra = safe + zip, meshoptimizer and astcenc modules off
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Get this repo (custom.py + build_profile.json)
+        uses: actions/checkout@v4
+        with:
+          path: slim
+
+      - name: Get Godot source
+        uses: actions/checkout@v4
+        with:
+          repository: godotengine/godot
+          ref: ${{ inputs.godot_ref }}
+          path: godot
+
+      - name: Read the Emscripten version this Godot release expects
+        id: em
+        shell: bash
+        run: |
+          v=$(grep -oP 'EM_VERSION:\s*\K[0-9.]+' godot/.github/workflows/web_builds.yml | head -1)
+          echo "version=${v:-4.0.11}" >> "$GITHUB_OUTPUT"
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: ${{ steps.em.outputs.version }}
+          actions-cache-folder: emsdk-cache
+
+      - run: python3 -m pip install scons
+
+      - name: Copy build config into the Godot source
+        run: cp slim/custom.py slim/build_profile.json godot/
+
+      - name: Build web template
+        shell: bash
+        working-directory: godot
+        run: |
+          EXTRA=""
+          if [ "${{ matrix.variant }}" = "extra" ]; then
+            EXTRA="module_zip_enabled=no module_meshoptimizer_enabled=no module_astcenc_enabled=no"
+          fi
+          scons platform=web target=template_release threads=no dlink_enabled=no \
+                build_profile=build_profile.json $EXTRA 2>&1 | tee ../build.log
+
+      - name: Package, check required engine parts, check size
+        id: pkg
+        shell: bash
+        run: |
+          zip=$(ls godot/bin/*.web.template_release*.nothreads.zip | head -1)
+          cp "$zip" web_template.zip
+          unzip -p web_template.zip godot.wasm > godot.wasm
+          size=$(wc -c < godot.wasm)
+          echo "Variant ${{ matrix.variant }}: new godot.wasm = $size bytes, old = $BASELINE_WASM_BYTES"
+          strings -n 3 godot.wasm > wasm_strings.txt
+          missing=""
+          for n in TextServerFallback JoltPhysicsServer3D WebSocketPeer HTTPClient VehicleBody3D \
+                   AudioStreamOggVorbis ItemList RichTextLabel LightmapGI Crypto JavaScriptBridge AudioEffectLimiter; do
+            grep -qx "$n" wasm_strings.txt || missing="$missing $n"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Engine parts MISSING from this build:$missing  (game would break). Do not use."
+            exit 1
+          fi
+          echo "All required engine parts present."
+          if [ "$size" -ge "$BASELINE_WASM_BYTES" ]; then
+            echo "::error::New wasm ($size) is NOT smaller than current ($BASELINE_WASM_BYTES)."
+            exit 1
+          fi
+          echo "OK: smaller by $(( BASELINE_WASM_BYTES - size )) bytes"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web_template_${{ matrix.variant }}
+          path: |
+            web_template.zip
+            build.log
